@@ -1,0 +1,179 @@
+#include <iostream>
+#include <fstream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <cstring>
+#include <arpa/inet.h>
+#include <chrono>
+using namespace std;
+
+#define BUF_SIZE 1024
+#define DEFAULT_PORT 8080
+
+// 定义包类型
+enum PacketType {
+    DATA,    // 数据包
+    SYN,     // 同步包（建立连接）
+    SYN_ACK, // 同步确认包
+    ACK,     // 确认包
+    FIN,     // 终止连接
+    FIN_ACK  // 终止确认包
+};
+
+// 数据包结构体
+struct message {
+    PacketType type;  // 包类型
+    u_long seq;       // 序列号
+    u_long ack;       // 确认号
+    u_short len;      // 数据长度
+    char data[BUF_SIZE]; // 数据
+    u_long checksum;  // 校验和
+};
+
+// 计算校验和
+u_long calculateChecksum(const message &msg) {
+    u_long sum = 0;
+    const u_char *data = reinterpret_cast<const u_char *>(&msg);
+
+    for (size_t i = 0; i < sizeof(msg) - sizeof(msg.checksum); ++i) {
+        sum += data[i];
+    }
+    return sum;
+}
+
+// 打印错误信息并退出
+void handleError(const string &message) {
+    cerr << message << endl;
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char *argv[]) {
+    const char *server_ip = (argc > 1) ? argv[1] : "127.0.0.1";
+    int port = (argc > 2) ? stoi(argv[2]) : DEFAULT_PORT;
+
+    int sockfd;
+    struct sockaddr_in servaddr{};
+    socklen_t servaddr_len = sizeof(servaddr);
+
+    ifstream input_file("send_file.txt", ios::in | ios::binary);
+    if (!input_file) {
+        handleError("Failed to open file for reading.");
+    }
+
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        handleError("Socket creation error.");
+    }
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(port);
+    if (inet_pton(AF_INET, server_ip, &servaddr.sin_addr) <= 0) {
+        close(sockfd);
+        handleError("Invalid address/Address not supported.");
+    }
+
+    message sendMsg{}, recvMsg{};
+    u_long seq = 0;
+
+    // ---------- 三次握手 ----------
+    // 发送 SYN 包
+    sendMsg.type = SYN;
+    sendMsg.seq = seq;
+    sendMsg.checksum = calculateChecksum(sendMsg);
+    sendto(sockfd, &sendMsg, sizeof(sendMsg), 0, (const struct sockaddr *)&servaddr, servaddr_len);
+    cout << "[Handshake] Sent SYN, seq=" << sendMsg.seq << endl;
+
+    // 接收 SYN-ACK 包
+    recvfrom(sockfd, &recvMsg, sizeof(recvMsg), 0, (struct sockaddr *)&servaddr, &servaddr_len);
+    if (recvMsg.type == SYN_ACK && recvMsg.ack == seq + 1) {
+        cout << "[Handshake] Received SYN-ACK, seq=" << recvMsg.seq << ", ack=" << recvMsg.ack << endl;
+
+        // 发送 ACK 包
+        sendMsg.type = ACK;
+        sendMsg.seq = recvMsg.ack;
+        sendMsg.ack = recvMsg.seq + 1;
+        sendMsg.checksum = calculateChecksum(sendMsg);
+        sendto(sockfd, &sendMsg, sizeof(sendMsg), 0, (const struct sockaddr *)&servaddr, servaddr_len);
+        cout << "[Handshake] Sent ACK, seq=" << sendMsg.seq << ", ack=" << sendMsg.ack << endl;
+
+        cout << "Connection established successfully!" << endl;
+    } else {
+        handleError("[Handshake] Failed to establish connection.");
+    }
+
+    streamsize transferredBytes = 0;
+    // 记录开始时间
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // ---------- 数据发送 ----------
+    while (true) {
+        input_file.read(sendMsg.data, BUF_SIZE);
+        sendMsg.len = input_file.gcount();
+        // 计算传输
+        streamsize bytesRead = sendMsg.len;
+        transferredBytes += bytesRead;
+
+        sendMsg.type = DATA;
+        sendMsg.seq = seq;
+        sendMsg.checksum = calculateChecksum(sendMsg);
+
+        sendto(sockfd, &sendMsg, sizeof(sendMsg), 0, (const struct sockaddr *)&servaddr, servaddr_len);
+        cout << "Sent packet " << seq << ", size: " << sendMsg.len << " bytes" << endl;
+
+        // 等待 ACK
+        recvfrom(sockfd, &recvMsg, sizeof(recvMsg), 0, (struct sockaddr *)&servaddr, &servaddr_len);
+        if (recvMsg.type == ACK && recvMsg.ack == seq + 1) {
+            cout << "Acknowledgment received for packet " << seq << endl;
+            seq++;
+        } else {
+            cerr << "Failed to receive correct ACK for packet " << seq << ". Retrying..." << endl;
+            continue; // 重发当前数据包
+        }
+
+        if (sendMsg.len == 0) {
+            cout << "File transfer complete." << endl;
+            break;
+        }
+    }
+
+    // 记录结束时间并计算吞吐率
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    double throughput = transferredBytes / duration.count() / 1024 / 1024; // MB/s
+    double delay = duration.count() * 1000; // ms
+
+    std::cout << "Total Transfer Time: " << duration.count() << " seconds" << std::endl;
+    std::cout << "Total Bytes Transferred: " << transferredBytes << " bytes" << std::endl;
+    std::cout << "Throughput: " << throughput << " MB/s" << std::endl;
+    std::cout << "Delay: " << delay << " ms" << std::endl;
+
+    // ---------- 四次挥手 ----------
+    // 发送 FIN 包
+    sendMsg.type = FIN;
+    sendMsg.seq = seq;
+    sendMsg.checksum = calculateChecksum(sendMsg);
+    sendto(sockfd, &sendMsg, sizeof(sendMsg), 0, (const struct sockaddr *)&servaddr, servaddr_len);
+    cout << "[Teardown] Sent FIN, seq=" << sendMsg.seq << endl;
+
+    // 接收 FIN-ACK 包
+    recvfrom(sockfd, &recvMsg, sizeof(recvMsg), 0, (struct sockaddr *)&servaddr, &servaddr_len);
+    if (recvMsg.type == FIN_ACK) {
+        cout << "[Teardown] Received FIN-ACK, seq=" << recvMsg.seq << ", ack=" << recvMsg.ack << endl;
+
+        // 发送最后的 ACK
+        sendMsg.type = ACK;
+        sendMsg.seq = recvMsg.ack;
+        sendMsg.ack = recvMsg.seq + 1;
+        sendMsg.checksum = calculateChecksum(sendMsg);
+        sendto(sockfd, &sendMsg, sizeof(sendMsg), 0, (const struct sockaddr *)&servaddr, servaddr_len);
+        cout << "[Teardown] Sent final ACK, seq=" << sendMsg.seq << ", ack=" << sendMsg.ack << endl;
+
+        cout << "Connection terminated successfully!" << endl;
+    } else {
+        cerr << "[Teardown] Failed to terminate connection!" << endl;
+    }
+
+    input_file.close();
+    close(sockfd);
+    return 0;
+}
